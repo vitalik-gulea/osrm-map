@@ -1,0 +1,10 @@
+version: '3'
+
+services:
+  osrm-backend:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/data
+    command: osrm-routed --algorithm mld --max-table-size 1000 --max-matching-size 1000 /data/all-states.osrm 

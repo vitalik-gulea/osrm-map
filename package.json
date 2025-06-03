@@ -1,0 +1,20 @@
+{
+  "name": "osrm-map",
+  "version": "1.0.0",
+  "description": "OSRM backend with US states data",
+  "main": "download-all-states.js",
+  "scripts": {
+    "download": "node download-all-states.js",
+    "merge": "node merge-states.js",
+    "start": "docker-compose up",
+    "start:detach": "docker-compose up -d",
+    "stop": "docker-compose down",
+    "clean": "rimraf data/* temp/*",
+    "build": "docker-compose build",
+    "rebuild": "npm run clean && npm run download && npm run merge && npm run build",
+    "restart": "npm run stop && npm run start"
+  },
+  "dependencies": {
+    "rimraf": "^5.0.5"
+  }
+} 
