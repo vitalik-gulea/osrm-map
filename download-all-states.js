@@ -59,6 +59,14 @@ const states = [
 const DATA_DIR = './data';
 const TEMP_DIR = './temp';
 
+// Конфигурация retry
+const RETRY_CONFIG = {
+    maxRetries: 3,
+    initialDelay: 2000, // 2 секунды
+    backoffMultiplier: 2,
+    timeout: 300000 // 5 минут таймаут
+};
+
 // Создаем директории если они не существуют
 [DATA_DIR, TEMP_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) {
@@ -66,20 +74,100 @@ const TEMP_DIR = './temp';
     }
 });
 
-async function downloadFile(url, dest) {
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function downloadFileWithRetry(url, dest, retryCount = 0) {
     return new Promise((resolve, reject) => {
         const file = fs.createWriteStream(dest);
-        https.get(url, (response) => {
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close();
-                resolve();
-            });
-        }).on('error', (err) => {
-            fs.unlink(dest, () => {});
-            reject(err);
+        let isResolved = false;
+        
+        // Устанавливаем таймаут
+        const timeout = setTimeout(() => {
+            if (!isResolved) {
+                isResolved = true;
+                file.destroy();
+                fs.unlink(dest, () => {});
+                reject(new Error('Timeout: загрузка превысила лимит времени'));
+            }
+        }, RETRY_CONFIG.timeout);
+
+        const request = https.get(url, {
+            timeout: 30000 // 30 секунд на соединение
+        }, (response) => {
+            if (response.statusCode === 200) {
+                response.pipe(file);
+                
+                file.on('finish', () => {
+                    if (!isResolved) {
+                        isResolved = true;
+                        file.close();
+                        clearTimeout(timeout);
+                        resolve();
+                    }
+                });
+                
+                file.on('error', (err) => {
+                    if (!isResolved) {
+                        isResolved = true;
+                        clearTimeout(timeout);
+                        fs.unlink(dest, () => {});
+                        reject(err);
+                    }
+                });
+            } else {
+                isResolved = true;
+                clearTimeout(timeout);
+                file.destroy();
+                fs.unlink(dest, () => {});
+                reject(new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`));
+            }
+        });
+
+        request.on('error', (err) => {
+            if (!isResolved) {
+                isResolved = true;
+                clearTimeout(timeout);
+                file.destroy();
+                fs.unlink(dest, () => {});
+                reject(err);
+            }
+        });
+
+        request.on('timeout', () => {
+            if (!isResolved) {
+                isResolved = true;
+                clearTimeout(timeout);
+                file.destroy();
+                fs.unlink(dest, () => {});
+                reject(new Error('Request timeout'));
+            }
         });
     });
+}
+
+async function downloadFile(url, dest) {
+    let lastError;
+    
+    for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+        try {
+            console.log(`Попытка загрузки ${attempt + 1}/${RETRY_CONFIG.maxRetries + 1}...`);
+            await downloadFileWithRetry(url, dest);
+            return; // Успешная загрузка
+        } catch (error) {
+            lastError = error;
+            console.warn(`Ошибка загрузки (попытка ${attempt + 1}):`, error.message);
+            
+            if (attempt < RETRY_CONFIG.maxRetries) {
+                const delay = RETRY_CONFIG.initialDelay * Math.pow(RETRY_CONFIG.backoffMultiplier, attempt);
+                console.log(`Ожидание ${delay / 1000} секунд перед повторной попыткой...`);
+                await sleep(delay);
+            }
+        }
+    }
+    
+    throw new Error(`Не удалось загрузить файл после ${RETRY_CONFIG.maxRetries + 1} попыток. Последняя ошибка: ${lastError.message}`);
 }
 
 async function processState(state) {
@@ -89,9 +177,19 @@ async function processState(state) {
     const url = `https://download.geofabrik.de/north-america/us/${state.code}-latest.osm.pbf`;
     
     try {
-        // Загрузка файла
+        // Проверяем, не обработан ли уже этот штат
+        const existingFiles = fs.readdirSync(DATA_DIR);
+        const stateFiles = existingFiles.filter(file => file.startsWith(state.code));
+        
+        if (stateFiles.length > 0) {
+            console.log(`${state.name} уже обработан, пропускаем...`);
+            return;
+        }
+
+        // Загрузка файла с retry логикой
         console.log(`Загрузка данных для ${state.name}...`);
         await downloadFile(url, pbfFile);
+        console.log(`✓ Загрузка ${state.name} завершена успешно`);
         
         // Обработка файла с помощью OSRM
         console.log(`Извлечение данных для ${state.name}...`);
@@ -107,30 +205,74 @@ async function processState(state) {
         const files = fs.readdirSync(TEMP_DIR);
         files.forEach(file => {
             if (file.startsWith(state.code)) {
-                fs.renameSync(
-                    path.join(TEMP_DIR, file),
-                    path.join(DATA_DIR, file)
-                );
+                const srcPath = path.join(TEMP_DIR, file);
+                const destPath = path.join(DATA_DIR, file);
+                
+                try {
+                    fs.renameSync(srcPath, destPath);
+                } catch (renameError) {
+                    // Если rename не работает, копируем и удаляем
+                    fs.copyFileSync(srcPath, destPath);
+                    fs.unlinkSync(srcPath);
+                }
             }
         });
         
-        console.log(`${state.name} успешно обработан!`);
+        console.log(`✓ ${state.name} успешно обработан!`);
+        
+        // Небольшая пауза между штатами
+        await sleep(1000);
+        
     } catch (error) {
-        console.error(`Ошибка при обработке ${state.name}:`, error);
+        console.error(`❌ Ошибка при обработке ${state.name}:`, error.message);
+        
+        // Очищаем частично загруженные файлы
+        try {
+            if (fs.existsSync(pbfFile)) {
+                fs.unlinkSync(pbfFile);
+            }
+        } catch (cleanupError) {
+            console.warn(`Предупреждение: не удалось очистить файл ${pbfFile}`);
+        }
     }
 }
 
 async function processAllStates() {
     console.log('Начинаем загрузку и обработку данных всех штатов США...');
+    console.log(`Настройки retry: максимум ${RETRY_CONFIG.maxRetries} попыток, таймаут ${RETRY_CONFIG.timeout/1000} секунд`);
+    
+    let processed = 0;
+    let failed = 0;
     
     for (const state of states) {
-        await processState(state);
+        try {
+            await processState(state);
+            processed++;
+        } catch (error) {
+            failed++;
+            console.error(`Окончательная ошибка для ${state.name}:`, error.message);
+        }
     }
     
-    console.log('\nВсе штаты обработаны!');
+    console.log(`\n📊 Итоги обработки:`);
+    console.log(`✓ Успешно обработано: ${processed} штатов`);
+    console.log(`❌ Ошибки: ${failed} штатов`);
+    console.log(`📁 Всего штатов: ${states.length}`);
     
-    // Очистка временной директории
-    fs.rmdirSync(TEMP_DIR, { recursive: true });
+    // Очистка временной директории только при полном успехе
+    if (failed === 0) {
+        try {
+            const tempFiles = fs.readdirSync(TEMP_DIR);
+            tempFiles.forEach(file => {
+                fs.unlinkSync(path.join(TEMP_DIR, file));
+            });
+            console.log('✓ Временные файлы очищены');
+        } catch (cleanupError) {
+            console.warn('Предупреждение: не удалось очистить временные файлы');
+        }
+    } else {
+        console.log('⚠️  Временные файлы сохранены для повторной обработки неудачных загрузок');
+    }
 }
 
 processAllStates().catch(console.error); 
